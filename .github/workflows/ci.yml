@@ -41,7 +41,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check --manifest-path=fxsplit/Cargo.toml
+        run: cargo fmt --all --manifest-path=fxsplit/Cargo.toml -- --check
 
   clippy:
     name: cargo clippy
