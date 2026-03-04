@@ -1,6 +1,47 @@
-# fxsplit
+<p align="center">
+  <p align="center">
+    <img width=200 align="center" src="./assets/fxsplit.png" >
+  </p>
 
-`fxsplit` splits FASTX files (plain or gzipped) into smaller chunks/files/headers.
+  <span>
+    <h1 align="center">
+        fxsplit
+    </h1>
+  </span>
+
+  <p align="center">
+    <a href="https://img.shields.io/badge/version-0.0.1-green" target="_blank">
+      <img alt="Version Badge" src="https://img.shields.io/badge/version-0.0.1-green">
+    </a>
+    <a href="https://crates.io/crates/fxsplit" target="_blank">
+      <img alt="Crates.io Version" src="https://img.shields.io/crates/v/fxsplit">
+    </a>
+    <a href="https://github.com/alejandrogzi/fxsplit" target="_blank">
+      <img alt="GitHub License" src="https://img.shields.io/github/license/alejandrogzi/fxsplit?color=blue">
+    </a>
+    <a href="https://crates.io/crates/fxsplit" target="_blank">
+      <img alt="Crates.io Total Downloads" src="https://img.shields.io/crates/d/fxsplit">
+    </a>
+  </p>
+
+
+  <p align="center">
+
+  </p>
+
+  <p align="center">
+    <samp>
+        <span>split FASTX files (plain or gzipped) into smaller chunks/files/headers</span>
+        <br>
+        <br>
+        <a href="https://docs.rs/fxsplit/0.0.33/fxsplit/">docs</a> .
+        <a href="https://github.com/alejandrogzi/fxsplit?tab=readme-ov-file#Usage">usage</a> .
+        <a href="https://github.com/alejandrogzi/fxsplit?tab=readme-ov-file#Installation">install</a> .
+        <a href="https://github.com/alejandrogzi/fxsplit?tab=readme-ov-file#Docker">docker</a>
+    </samp>
+  </p>
+  
+</p>
 
 ## Split modes
 
@@ -13,7 +54,7 @@
 ## Install
 
 ```bash
-cargo install --path .
+cargo install fxsplit
 ```
 
 ## Usage
@@ -38,4 +79,10 @@ Run:
 ```bash
 docker run --rm fxsplit:local fxsplit --help
 docker run --rm -v "$PWD:/data" fxsplit:local fxsplit --file /data/input.fasta --chunks 1000 --outdir /data/out
+```
+
+Pull:
+
+```bash
+docker pull alejandrogzi/fxsplit:latest
 ```
