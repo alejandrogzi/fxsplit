@@ -34,7 +34,7 @@
         <span>split FASTX files (plain or gzipped) into smaller chunks/files/headers</span>
         <br>
         <br>
-        <a href="https://docs.rs/fxsplit/0.0.33/fxsplit/">docs</a> .
+        <a href="https://docs.rs/fxsplit/0.0.1/fxsplit/">docs</a> .
         <a href="https://github.com/alejandrogzi/fxsplit?tab=readme-ov-file#Usage">usage</a> .
         <a href="https://github.com/alejandrogzi/fxsplit?tab=readme-ov-file#Installation">install</a> .
         <a href="https://github.com/alejandrogzi/fxsplit?tab=readme-ov-file#Docker">docker</a>
