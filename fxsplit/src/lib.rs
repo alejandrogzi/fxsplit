@@ -762,7 +762,13 @@ pub fn split_fa_gz(args: &Args) -> Result<()> {
                 header.len(),
                 records_per_file
             );
-            symlink(&args.file, &outpath)?;
+
+            if args.copy {
+                std::fs::copy(&args.file, &outpath)?;
+            } else {
+                symlink(&args.file, &outpath)?;
+            }
+
             return Ok(());
         }
     }

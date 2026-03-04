@@ -1,7 +1,7 @@
 [package]
 name = "fxsplit"
 description = "split FASTX into N chunks/files/headers"
-version = "0.0.1"
+version = "0.0.2"
 keywords = ["split", "fasta", "fastq", "io"]
 readme = "../README.md"
 homepage = "https://github.com/alejandrogzi/isotools"

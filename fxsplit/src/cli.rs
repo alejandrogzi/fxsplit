@@ -111,6 +111,15 @@ pub struct Args {
         help = "Suffix to append at the end of the chunk file"
     )]
     pub suffix: Option<String>,
+
+    #[arg(
+        short = 'C',
+        long = "copy",
+        required = false,
+        help = "Copy the input file instead of creating a symlink",
+        action = clap::ArgAction::SetTrue
+    )]
+    pub copy: bool,
 }
 
 impl Args {
