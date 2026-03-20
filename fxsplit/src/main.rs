@@ -1,68 +1,24 @@
-//! Core module for splitting a .fa/.fq file into chunks
-//! Alejandro Gonzales-Irribarren, 2026
-//!
-//! This module contains the main function for splitting .fa/.fq files
-//! based on custom requirements in parallel.
-//!
-//! In short, the module accepts any type of .fa or .fq file
-//! and process the reads or sequences inside them in parallel
-//! when is possible. Compressed files are also accepted. The
-//! user has the ability to specify is the splitting process should
-//! be done based on specific chunk sizes or number of files, and
-//! the amount of parallelization that should be used in the process.
+// Copyright (c) 2026 Alejandro Gonzalez-Irribarren <alejandrxgzi@gmail.com>
+// Distributed under the terms of the Apache License, Version 2.0.
 
-use anyhow::Result;
-use clap::{self, Parser};
-use fxsplit::cli::Args;
-use log::{info, Level};
+use clap::Parser;
+use fxsplit::{cli::Args, run};
+use log::{error, info, Level};
 use simple_logger::init_with_level;
 
-use fxsplit::*;
-
-/// Parses command-line arguments and dispatches to the appropriate
-/// splitting function based on input file type.
-///
-/// # Arguments
-///
-/// Takes command-line arguments from the shell:
-///
-/// * `-f, --file` - Input FASTA/FASTQ file (required)
-/// * `-c, --chunks` - Records per output file
-/// * `-F, --files` - Number of output files
-/// * `-H, --headers` - Split by FASTA header
-/// * `-t, --threads` - Number of threads (default: CPU count)
-/// * `-o, --outdir` - Output directory (default: "chunks")
-/// * `-s, --suffix` - Optional suffix for output files
-///
-/// # Returns
-///
-/// * `Result<()>` - Success or error
-///
-/// # Example
-///
-/// ```rust, ignore
-/// // Run from command line:
-/// // fxsplit -f input.fa.gz -c 1000 -o output -t 4
-/// ```
-fn main() -> Result<()> {
+/// Main entry point for the fxsplit CLI.
+fn main() {
     let start = std::time::Instant::now();
     init_with_level(Level::Info).unwrap();
 
-    let args: Args = Args::parse();
+    let args = Args::parse();
+    if let Err(err) = run(&args) {
+        error!("{err}");
+        for cause in err.chain().skip(1) {
+            error!("caused by: {cause}");
+        }
+        std::process::exit(1);
+    }
 
-    dispatch!(&args.file, {
-        "fa.gz" => split_fa_gz(&args)?,
-        "fasta.gz" =>  split_fa_gz(&args)?,
-        "fq.gz" =>  split_fq(&args)?,
-        "fastq.gz" =>  split_fq(&args)?,
-        "fq" =>  split_fq(&args)?,
-        "fastq" =>  split_fq(&args)?,
-        "fa" =>  split_fa(&args)?,
-        "fasta" =>  split_fa(&args)?,
-    });
-
-    let elapsed = start.elapsed();
-    info!("Elapsed time: {:?}", elapsed);
-
-    Ok(())
+    info!("Elapsed time: {:?}", start.elapsed());
 }

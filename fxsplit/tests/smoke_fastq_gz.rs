@@ -19,6 +19,8 @@ fn fastq_gz_chunks_mean_records_per_file() {
         path_str(&input),
         "--chunks".to_string(),
         "2".to_string(),
+        "--threads".to_string(),
+        "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
     ]);
@@ -46,6 +48,8 @@ fn fastq_gz_files_mean_number_of_output_files() {
         path_str(&input),
         "--files".to_string(),
         "3".to_string(),
+        "--threads".to_string(),
+        "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
     ]);
@@ -72,9 +76,11 @@ fn fastq_gz_rejects_headers_mode() {
         "--file".to_string(),
         path_str(&input),
         "--headers".to_string(),
+        "--threads".to_string(),
+        "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
     ]);
 
-    assert!(err.contains("only supported for FASTA/FASTA.GZ"));
+    assert!(err.contains("only supported for FASTA/FASTA.GZ/2BIT"));
 }

@@ -31,7 +31,7 @@
 
   <p align="center">
     <samp>
-        <span>split FASTX files (plain or gzipped) into smaller chunks/files/headers</span>
+        <span>split FASTX (and 2bit) files (plain or gzipped) into smaller chunks/files/headers</span>
         <br>
         <br>
         <a href="https://docs.rs/fxsplit/0.0.1/fxsplit/">docs</a> .
@@ -68,21 +68,33 @@ fxsplit --file input.fasta.gz --headers --outdir by_header
 
 ## Docker
 
-Build:
+build:
 
 ```bash
 docker build -t fxsplit:local .
 ```
 
-Run:
+run:
 
 ```bash
 docker run --rm fxsplit:local fxsplit --help
 docker run --rm -v "$PWD:/data" fxsplit:local fxsplit --file /data/input.fasta --chunks 1000 --outdir /data/out
 ```
 
-Pull:
+pull:
 
 ```bash
 docker pull alejandrogzi/fxsplit:latest
 ```
+
+## Nextflow
+
+borrow fxsplit module from [fxsplit/main.nf](https://github.com/alejandrogzi/fxsplit/blob/main/assets/nextflow/fxsplit/main.nf) and use it in your pipeline.
+
+## Conda
+
+```bash
+conda install -c bioconda fxsplit
+```
+
+
