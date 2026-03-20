@@ -18,6 +18,8 @@ fn fasta_gz_chunks_mean_records_per_file() {
         path_str(&input),
         "--chunks".to_string(),
         "2".to_string(),
+        "--threads".to_string(),
+        "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
     ]);
@@ -48,6 +50,8 @@ fn fasta_gz_files_mean_number_of_output_files() {
         path_str(&input),
         "--files".to_string(),
         "3".to_string(),
+        "--threads".to_string(),
+        "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
     ]);
@@ -74,6 +78,8 @@ fn fasta_gz_headers_use_sanitized_ids() {
         "--file".to_string(),
         path_str(&input),
         "--headers".to_string(),
+        "--threads".to_string(),
+        "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
     ]);
