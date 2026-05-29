@@ -21,7 +21,10 @@ fn fastq_input_to_fasta_output() {
     let t = tempdir();
     let input = join(t.path(), "input.fastq");
     let outdir = join(t.path(), "out");
-    write_text(&input, "@r1\nAAAA\n+\n!!!!\n@r2\nCCCC\n+\n####\n@r3\nGGGG\n+\n$$$$\n");
+    write_text(
+        &input,
+        "@r1\nAAAA\n+\n!!!!\n@r2\nCCCC\n+\n####\n@r3\nGGGG\n+\n$$$$\n",
+    );
 
     run_split(args(
         &input,
@@ -202,7 +205,10 @@ fn fasta_input_rejects_fastq_output() {
         &outdir,
         &["--chunks", "1", "--output-format", "fastq"],
     ));
-    assert!(err.contains("cannot produce FASTQ from FASTA"), "got: {err}");
+    assert!(
+        err.contains("cannot produce FASTQ from FASTA"),
+        "got: {err}"
+    );
 }
 
 #[test]

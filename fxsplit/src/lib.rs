@@ -221,7 +221,9 @@ impl SequenceWriter {
         Ok(match compression {
             None => Self::Plain(buffer),
             Some(Compression::Gzip) => Self::Gzip(GzEncoder::new(buffer, GzCompression::fast())),
-            Some(Compression::Bzip2) => Self::Bzip2(BzEncoder::new(buffer, bzip2::Compression::fast())),
+            Some(Compression::Bzip2) => {
+                Self::Bzip2(BzEncoder::new(buffer, bzip2::Compression::fast()))
+            }
             Some(Compression::Zstd) => Self::Zstd(zstd::Encoder::new(buffer, 3)?),
         })
     }
@@ -373,9 +375,7 @@ pub fn split_fq(args: &Args) -> Result<()> {
     match resolve_input(args)? {
         ResolvedInput::FastqPath(path) => split_fastq_path(args, &path),
         ResolvedInput::FastqGzPath(path) => split_fastq_gz_path(args, &path),
-        ResolvedInput::FastqMemory { data } => {
-            split_fastq_bytes(args, data)
-        }
+        ResolvedInput::FastqMemory { data } => split_fastq_bytes(args, data),
         _ => anyhow::bail!("ERROR: input is not FASTQ"),
     }
 }
@@ -561,9 +561,8 @@ fn fasta_input_output_extension(
     source_path: Option<&Path>,
 ) -> String {
     if format == OutputFormat::Fasta
-        && source_path.is_some_and(|path| {
-            path_ends_with(path, ".fasta") || path_ends_with(path, ".fasta.gz")
-        })
+        && source_path
+            .is_some_and(|path| path_ends_with(path, ".fasta") || path_ends_with(path, ".fasta.gz"))
     {
         format!("fasta{}", compression_suffix(compression))
     } else {
@@ -643,11 +642,7 @@ fn split_2bit_path(args: &Args, path: &Path) -> Result<()> {
 /// * `args` - Command-line arguments
 /// * `data` - FASTA data to split
 /// * `source_path` - Original file path for passthrough optimization
-fn split_fasta_bytes<B>(
-    args: &Args,
-    data: SharedBytes<B>,
-    source_path: Option<&Path>,
-) -> Result<()>
+fn split_fasta_bytes<B>(args: &Args, data: SharedBytes<B>, source_path: Option<&Path>) -> Result<()>
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
@@ -1379,7 +1374,10 @@ fn twobit_record_to_fasta(record: &TwoBitSequence, line_width: usize, out: &mut 
 /// any base not representable in 2bit (anything other than A/C/G/T/U/N).
 fn build_twobit_sequence(name: String, sequence: &[u8], no_mask: bool) -> Result<TwoBitSequence> {
     let bases: Vec<u8> = if no_mask {
-        sequence.iter().map(|byte| byte.to_ascii_uppercase()).collect()
+        sequence
+            .iter()
+            .map(|byte| byte.to_ascii_uppercase())
+            .collect()
     } else {
         sequence.to_vec()
     };
