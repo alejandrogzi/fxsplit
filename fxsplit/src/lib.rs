@@ -14,9 +14,10 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use bzip2::write::BzEncoder;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
+use flate2::Compression as GzCompression;
 use memchr::{memchr, memchr_iter};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -31,6 +32,8 @@ const TWOBIT_MAGIC: [u8; 4] = [0x1A, 0x41, 0x27, 0x43];
 const TWOBIT_MAGIC_REVERSED: [u8; 4] = [0x43, 0x27, 0x41, 0x1A];
 const HEADER_SPLIT_WARN_THRESHOLD: usize = 100_000;
 const TWOBIT_SIGNATURE: u32 = 0x1A41_2743;
+/// Line width used when wrapping sequences emitted as FASTA from 2bit input.
+const FASTA_LINE_WIDTH: usize = 60;
 
 /// Detects the input format based on file content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,21 +69,71 @@ enum ResolvedInput {
     FastaMemory {
         /// The FASTA data bytes
         data: SharedBytes<Vec<u8>>,
-        /// Whether output should be gzipped
-        gzip_output: bool,
     },
     /// FASTQ data in memory
     FastqMemory {
         /// The FASTQ data bytes
         data: SharedBytes<Vec<u8>>,
-        /// Whether output should be gzipped
-        gzip_output: bool,
     },
     /// 2bit data in memory
     TwoBitMemory {
         /// The 2bit data bytes
         data: SharedBytes<Vec<u8>>,
     },
+}
+
+/// Output sequence format selected via `--output-format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Plain or compressed FASTA
+    Fasta,
+    /// Plain or compressed FASTQ (only valid when the input is FASTQ)
+    Fastq,
+    /// UCSC 2bit binary (never compressed)
+    #[value(name = "2bit")]
+    TwoBit,
+}
+
+impl OutputFormat {
+    /// Human-readable label used in diagnostics.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fasta => "FASTA",
+            Self::Fastq => "FASTQ",
+            Self::TwoBit => "2bit",
+        }
+    }
+}
+
+/// Output compression codec selected via `--compression`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Compression {
+    /// gzip (DEFLATE) compression
+    Gzip,
+    /// bzip2 compression
+    Bzip2,
+    /// Zstandard compression
+    Zstd,
+}
+
+impl Compression {
+    /// Returns the filename suffix (including the leading dot) for this codec.
+    fn extension_suffix(self) -> &'static str {
+        match self {
+            Self::Gzip => ".gz",
+            Self::Bzip2 => ".bz2",
+            Self::Zstd => ".zst",
+        }
+    }
+}
+
+/// Distinguishes the source byte layout passed to `write_chunk`.
+#[derive(Debug, Clone, Copy)]
+enum SourceKind {
+    /// FASTA record bytes
+    Fasta,
+    /// FASTQ record bytes
+    Fastq,
 }
 
 /// Defines how records should be distributed across output files.
@@ -140,40 +193,43 @@ impl<B: AsRef<[u8]>> AsRef<[u8]> for SharedBytes<B> {
     }
 }
 
-/// Writer for sequence files supporting plain and gzipped output.
+/// Writer for sequence files supporting plain and compressed output.
 enum SequenceWriter {
     /// Plain text writer
     Plain(BufWriter<File>),
     /// Gzipped writer
     Gzip(GzEncoder<BufWriter<File>>),
+    /// bzip2 writer
+    Bzip2(BzEncoder<BufWriter<File>>),
+    /// Zstandard writer
+    Zstd(zstd::Encoder<'static, BufWriter<File>>),
 }
 
 impl SequenceWriter {
-    /// Creates a new SequenceWriter for the given path.
+    /// Creates a new SequenceWriter for the given path and compression codec.
     ///
     /// # Arguments
     /// * `path` - Output file path
-    /// * `gzip_output` - Whether to gzip the output
+    /// * `compression` - Compression codec, or `None` for plain output
     ///
     /// # Example
     /// ```rust, ignore
-    /// let writer = SequenceWriter::create(Path::new("output.fa"), false)?;
+    /// let writer = SequenceWriter::create(Path::new("output.fa"), None)?;
     /// ```
-    fn create(path: &Path, gzip_output: bool) -> Result<Self> {
-        let file = File::create(path)?;
-        if gzip_output {
-            Ok(Self::Gzip(GzEncoder::new(
-                BufWriter::new(file),
-                Compression::fast(),
-            )))
-        } else {
-            Ok(Self::Plain(BufWriter::new(file)))
-        }
+    fn create(path: &Path, compression: Option<Compression>) -> Result<Self> {
+        let buffer = BufWriter::new(File::create(path)?);
+        Ok(match compression {
+            None => Self::Plain(buffer),
+            Some(Compression::Gzip) => Self::Gzip(GzEncoder::new(buffer, GzCompression::fast())),
+            Some(Compression::Bzip2) => Self::Bzip2(BzEncoder::new(buffer, bzip2::Compression::fast())),
+            Some(Compression::Zstd) => Self::Zstd(zstd::Encoder::new(buffer, 3)?),
+        })
     }
 
     /// Flushes and finalizes the writer.
     ///
-    /// For gzip writers, this ensures all data is compressed and written.
+    /// For compressed writers, this ensures all data is flushed and the
+    /// codec trailer is written.
     fn finish(self) -> Result<()> {
         match self {
             Self::Plain(mut writer) => {
@@ -182,6 +238,17 @@ impl SequenceWriter {
             }
             Self::Gzip(mut encoder) => {
                 encoder.flush()?;
+                let mut writer = encoder.finish()?;
+                writer.flush()?;
+                Ok(())
+            }
+            Self::Bzip2(mut encoder) => {
+                encoder.flush()?;
+                let mut writer = encoder.finish()?;
+                writer.flush()?;
+                Ok(())
+            }
+            Self::Zstd(encoder) => {
                 let mut writer = encoder.finish()?;
                 writer.flush()?;
                 Ok(())
@@ -195,6 +262,8 @@ impl Write for SequenceWriter {
         match self {
             Self::Plain(writer) => writer.write(buf),
             Self::Gzip(writer) => writer.write(buf),
+            Self::Bzip2(writer) => writer.write(buf),
+            Self::Zstd(writer) => writer.write(buf),
         }
     }
 
@@ -202,6 +271,8 @@ impl Write for SequenceWriter {
         match self {
             Self::Plain(writer) => writer.flush(),
             Self::Gzip(writer) => writer.flush(),
+            Self::Bzip2(writer) => writer.flush(),
+            Self::Zstd(writer) => writer.flush(),
         }
     }
 }
@@ -240,16 +311,8 @@ pub fn run(args: &Args) -> Result<()> {
         ResolvedInput::FastqPath(path) => split_fastq_path(args, &path),
         ResolvedInput::FastqGzPath(path) => split_fastq_gz_path(args, &path),
         ResolvedInput::TwoBitPath(path) => split_2bit_path(args, &path),
-        ResolvedInput::FastaMemory { data, gzip_output } => split_fasta_bytes(
-            args,
-            data,
-            default_fasta_extension(gzip_output),
-            gzip_output,
-            None,
-        ),
-        ResolvedInput::FastqMemory { data, gzip_output } => {
-            split_fastq_bytes(args, data, gzip_output)
-        }
+        ResolvedInput::FastaMemory { data } => split_fasta_bytes(args, data, None),
+        ResolvedInput::FastqMemory { data } => split_fastq_bytes(args, data),
         ResolvedInput::TwoBitMemory { data } => split_2bit_bytes(args, data),
     }
 }
@@ -280,10 +343,7 @@ pub fn lib_iso_split(args: Vec<String>) -> Result<()> {
 pub fn split_fa(args: &Args) -> Result<()> {
     match resolve_input(args)? {
         ResolvedInput::FastaPath(path) => split_fasta_path(args, &path),
-        ResolvedInput::FastaMemory {
-            data,
-            gzip_output: false,
-        } => split_fasta_bytes(args, data, default_fasta_extension(false), false, None),
+        ResolvedInput::FastaMemory { data } => split_fasta_bytes(args, data, None),
         _ => anyhow::bail!("ERROR: input is not plain FASTA"),
     }
 }
@@ -298,10 +358,6 @@ pub fn split_fa(args: &Args) -> Result<()> {
 pub fn split_fa_gz(args: &Args) -> Result<()> {
     match resolve_input(args)? {
         ResolvedInput::FastaGzPath(path) => split_fasta_gz_path(args, &path),
-        ResolvedInput::FastaMemory {
-            data,
-            gzip_output: true,
-        } => split_fasta_bytes(args, data, default_fasta_extension(true), true, None),
         _ => anyhow::bail!("ERROR: input is not gzipped FASTA"),
     }
 }
@@ -317,8 +373,8 @@ pub fn split_fq(args: &Args) -> Result<()> {
     match resolve_input(args)? {
         ResolvedInput::FastqPath(path) => split_fastq_path(args, &path),
         ResolvedInput::FastqGzPath(path) => split_fastq_gz_path(args, &path),
-        ResolvedInput::FastqMemory { data, gzip_output } => {
-            split_fastq_bytes(args, data, gzip_output)
+        ResolvedInput::FastqMemory { data } => {
+            split_fastq_bytes(args, data)
         }
         _ => anyhow::bail!("ERROR: input is not FASTQ"),
     }
@@ -379,11 +435,9 @@ fn resolve_stdin_input() -> Result<ResolvedInput> {
         return Ok(match detect_text_format(&decompressed)? {
             InputFormat::Fasta => ResolvedInput::FastaMemory {
                 data: SharedBytes::from_arc(Arc::new(decompressed)),
-                gzip_output: true,
             },
             InputFormat::Fastq => ResolvedInput::FastqMemory {
                 data: SharedBytes::from_arc(Arc::new(decompressed)),
-                gzip_output: true,
             },
             _ => anyhow::bail!("ERROR: unsupported gzipped stdin format"),
         });
@@ -392,11 +446,9 @@ fn resolve_stdin_input() -> Result<ResolvedInput> {
     Ok(match detect_text_format(&data)? {
         InputFormat::Fasta => ResolvedInput::FastaMemory {
             data: SharedBytes::from_arc(Arc::new(data)),
-            gzip_output: false,
         },
         InputFormat::Fastq => ResolvedInput::FastqMemory {
             data: SharedBytes::from_arc(Arc::new(data)),
-            gzip_output: false,
         },
         _ => anyhow::bail!("ERROR: unsupported stdin format"),
     })
@@ -485,39 +537,68 @@ fn path_ends_with(path: &Path, suffix: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns appropriate FASTA extension based on input path.
-fn fasta_output_extension(path: &Path) -> &'static str {
-    if path_ends_with(path, ".fasta") {
-        "fasta"
-    } else {
-        "fa"
+/// Returns the filename suffix (e.g. `.gz`) for the given compression codec.
+fn compression_suffix(compression: Option<Compression>) -> &'static str {
+    compression.map(Compression::extension_suffix).unwrap_or("")
+}
+
+/// Computes the output file extension from the output format and compression.
+///
+/// 2bit never carries a compression suffix.
+fn output_extension(format: OutputFormat, compression: Option<Compression>) -> String {
+    match format {
+        OutputFormat::Fasta => format!("fa{}", compression_suffix(compression)),
+        OutputFormat::Fastq => format!("fastq{}", compression_suffix(compression)),
+        OutputFormat::TwoBit => "2bit".to_string(),
     }
 }
 
-/// Returns appropriate gzipped FASTA extension based on input path.
-fn fasta_gz_output_extension(path: &Path) -> &'static str {
-    if path_ends_with(path, ".fasta.gz") {
-        "fasta.gz"
+/// Computes the FASTA-input output extension, preserving the longer `fasta`
+/// spelling when the identity FASTA path used a `.fasta`/`.fasta.gz` source.
+fn fasta_input_output_extension(
+    format: OutputFormat,
+    compression: Option<Compression>,
+    source_path: Option<&Path>,
+) -> String {
+    if format == OutputFormat::Fasta
+        && source_path.is_some_and(|path| {
+            path_ends_with(path, ".fasta") || path_ends_with(path, ".fasta.gz")
+        })
+    {
+        format!("fasta{}", compression_suffix(compression))
     } else {
-        "fa.gz"
+        output_extension(format, compression)
     }
 }
 
-/// Returns default FASTA extension based on gzip flag.
-fn default_fasta_extension(gzip_output: bool) -> &'static str {
-    if gzip_output {
-        "fasta.gz"
-    } else {
-        "fasta"
+/// Resolves and validates the output format for a given natural input format.
+///
+/// `--output-format` defaults to the natural format. FASTQ output is only
+/// permitted when the input is FASTQ (no quality scores exist otherwise).
+fn resolve_output_format(natural: OutputFormat, args: &Args) -> Result<OutputFormat> {
+    let requested = args.output_format.unwrap_or(natural);
+    if requested == OutputFormat::Fastq && natural != OutputFormat::Fastq {
+        anyhow::bail!(
+            "ERROR: cannot produce FASTQ from {} input (no quality scores)",
+            natural.label()
+        );
     }
+    Ok(requested)
 }
 
-/// Returns appropriate FASTQ extension based on gzip flag.
-fn fastq_output_extension(gzip_output: bool) -> &'static str {
-    if gzip_output {
-        "fastq.gz"
+/// Determines the effective compression for an output, forcing 2bit outputs
+/// to be uncompressed (and warning once if a codec was requested for them).
+fn effective_compression(
+    format: OutputFormat,
+    compression: Option<Compression>,
+) -> Option<Compression> {
+    if format == OutputFormat::TwoBit {
+        if compression.is_some() {
+            log::warn!("WARNING: 2bit outputs are never compressed; ignoring --compression");
+        }
+        None
     } else {
-        "fastq"
+        compression
     }
 }
 
@@ -525,34 +606,28 @@ fn fastq_output_extension(gzip_output: bool) -> &'static str {
 fn split_fasta_path(args: &Args, path: &Path) -> Result<()> {
     log::info!("INFO: running in FASTA mode with args: {:?}", args);
     let data = SharedBytes::from_arc(Arc::new(mmap_file(path)?));
-    split_fasta_bytes(args, data, fasta_output_extension(path), false, Some(path))
+    split_fasta_bytes(args, data, Some(path))
 }
 
 /// Splits gzipped FASTA file at given path.
 fn split_fasta_gz_path(args: &Args, path: &Path) -> Result<()> {
     log::info!("INFO: running in FASTA.GZ mode with args: {:?}", args);
     let data = SharedBytes::from_arc(Arc::new(decompress_gzip_file(path)?));
-    split_fasta_bytes(
-        args,
-        data,
-        fasta_gz_output_extension(path),
-        true,
-        Some(path),
-    )
+    split_fasta_bytes(args, data, Some(path))
 }
 
 /// Splits plain FASTQ file at given path.
 fn split_fastq_path(args: &Args, path: &Path) -> Result<()> {
     log::info!("INFO: running in FASTQ mode with args: {:?}", args);
     let data = SharedBytes::from_arc(Arc::new(mmap_file(path)?));
-    split_fastq_bytes(args, data, false)
+    split_fastq_bytes(args, data)
 }
 
 /// Splits gzipped FASTQ file at given path.
 fn split_fastq_gz_path(args: &Args, path: &Path) -> Result<()> {
     log::info!("INFO: running in FASTQ.GZ mode with args: {:?}", args);
     let data = SharedBytes::from_arc(Arc::new(decompress_gzip_file(path)?));
-    split_fastq_bytes(args, data, true)
+    split_fastq_bytes(args, data)
 }
 
 /// Splits 2bit file at given path.
@@ -567,20 +642,19 @@ fn split_2bit_path(args: &Args, path: &Path) -> Result<()> {
 /// # Arguments
 /// * `args` - Command-line arguments
 /// * `data` - FASTA data to split
-/// * `extension` - Output file extension
-/// * `gzip_output` - Whether output should be gzipped
 /// * `source_path` - Original file path for passthrough optimization
 fn split_fasta_bytes<B>(
     args: &Args,
     data: SharedBytes<B>,
-    extension: &'static str,
-    gzip_output: bool,
     source_path: Option<&Path>,
 ) -> Result<()>
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
     let mode = args.mode()?;
+    let out_fmt = resolve_output_format(OutputFormat::Fasta, args)?;
+    let compression = effective_compression(out_fmt, args.compression);
+    let extension = fasta_input_output_extension(out_fmt, compression, source_path);
     let pool = build_thread_pool(args.threads)?;
     let headers = find_fasta_headers(data.as_slice());
 
@@ -597,9 +671,10 @@ where
     create_dir_all(&args.outdir)?;
     let suffix = args.suffix.clone().unwrap_or_default();
 
-    if gzip_output
+    if out_fmt == OutputFormat::Fasta
         && !args.no_mask
-        && maybe_passthrough_original_file(args, source_path, mode, headers.len(), extension)?
+        && passthrough_compression_matches(source_path, compression)
+        && maybe_passthrough_original_file(args, source_path, mode, headers.len(), &extension)?
     {
         return Ok(());
     }
@@ -610,7 +685,7 @@ where
             .iter()
             .map(|&start| extract_fasta_id(data.as_slice(), start))
             .collect::<Vec<_>>();
-        let filenames = make_unique_filenames_from_ids(&ids, &suffix, extension);
+        let filenames = make_unique_filenames_from_ids(&ids, &suffix, &extension);
 
         pool.install(|| {
             headers
@@ -619,10 +694,12 @@ where
                 .try_for_each(|(index, &start)| -> Result<()> {
                     let end = *headers.get(index + 1).unwrap_or(&data.as_slice().len());
                     let output = PathBuf::from(&args.outdir).join(&filenames[index]);
-                    write_fasta_output(
+                    write_chunk(
                         &output,
                         &data.as_slice()[start..end],
-                        gzip_output,
+                        SourceKind::Fasta,
+                        out_fmt,
+                        compression,
                         args.no_mask,
                     )
                 })
@@ -642,11 +719,13 @@ where
                 let start = *headers.get(range.start).unwrap_or(&data.as_slice().len());
                 let end = *headers.get(range.end).unwrap_or(&data.as_slice().len());
                 let output = PathBuf::from(&args.outdir)
-                    .join(numbered_output_name(prefix, index, &suffix, extension));
-                write_fasta_output(
+                    .join(numbered_output_name(prefix, index, &suffix, &extension));
+                write_chunk(
                     &output,
                     &data.as_slice()[start..end],
-                    gzip_output,
+                    SourceKind::Fasta,
+                    out_fmt,
+                    compression,
                     args.no_mask,
                 )
             })
@@ -660,8 +739,7 @@ where
 /// # Arguments
 /// * `args` - Command-line arguments
 /// * `data` - FASTQ data to split
-/// * `gzip_output` - Whether output should be gzipped
-fn split_fastq_bytes<B>(args: &Args, data: SharedBytes<B>, gzip_output: bool) -> Result<()>
+fn split_fastq_bytes<B>(args: &Args, data: SharedBytes<B>) -> Result<()>
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
@@ -672,6 +750,9 @@ where
         );
     }
 
+    let out_fmt = resolve_output_format(OutputFormat::Fastq, args)?;
+    let compression = effective_compression(out_fmt, args.compression);
+    let extension = output_extension(out_fmt, compression);
     let pool = build_thread_pool(args.threads)?;
     let suffix = args.suffix.clone().unwrap_or_default();
     let record_starts = find_fastq_record_starts(data.as_slice())?;
@@ -697,16 +778,14 @@ where
                 let end = *record_starts
                     .get(range.end)
                     .unwrap_or(&data.as_slice().len());
-                let output = PathBuf::from(&args.outdir).join(numbered_output_name(
-                    prefix,
-                    index,
-                    &suffix,
-                    fastq_output_extension(gzip_output),
-                ));
-                write_fastq_output(
+                let output = PathBuf::from(&args.outdir)
+                    .join(numbered_output_name(prefix, index, &suffix, &extension));
+                write_chunk(
                     &output,
                     &data.as_slice()[start..end],
-                    gzip_output,
+                    SourceKind::Fastq,
+                    out_fmt,
+                    compression,
                     args.no_mask,
                 )
             })
@@ -725,6 +804,9 @@ where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
     let mode = args.mode()?;
+    let out_fmt = resolve_output_format(OutputFormat::TwoBit, args)?;
+    let compression = effective_compression(out_fmt, args.compression);
+    let extension = output_extension(out_fmt, compression);
     let pool = build_thread_pool(args.threads)?;
     let suffix = args.suffix.clone().unwrap_or_default();
 
@@ -753,7 +835,7 @@ where
 
     if matches!(mode, SplitMode::FileHeader) {
         warn_if_many_header_outputs(names.len(), &input_label(args));
-        let filenames = make_unique_filenames_from_ids(&names, &suffix, "2bit");
+        let filenames = make_unique_filenames_from_ids(&names, &suffix, &extension);
 
         pool.install(|| {
             names
@@ -770,6 +852,8 @@ where
                             start: index,
                             end: index + 1,
                         },
+                        out_fmt,
+                        compression,
                         !args.no_mask,
                     )
                 })
@@ -787,13 +871,15 @@ where
             .enumerate()
             .try_for_each(|(index, range)| -> Result<()> {
                 let output = PathBuf::from(&args.outdir)
-                    .join(numbered_output_name(prefix, index, &suffix, "2bit"));
+                    .join(numbered_output_name(prefix, index, &suffix, &extension));
                 write_twobit_group(
                     &output,
                     data.clone(),
                     &names,
                     &lengths,
                     range,
+                    out_fmt,
+                    compression,
                     !args.no_mask,
                 )
             })
@@ -810,13 +896,18 @@ where
 /// * `names` - Sequence names
 /// * `lengths` - Sequence lengths
 /// * `range` - Which sequences to write
+/// * `out_fmt` - Output format (2bit identity or FASTA conversion)
+/// * `compression` - Compression codec for FASTA output (ignored for 2bit)
 /// * `preserve_softmask` - Whether to preserve soft-masking
+#[allow(clippy::too_many_arguments)]
 fn write_twobit_group<B>(
     output: &Path,
     data: SharedBytes<B>,
     names: &[String],
     lengths: &[usize],
     range: ChunkRegion,
+    out_fmt: OutputFormat,
+    compression: Option<Compression>,
     preserve_softmask: bool,
 ) -> Result<()>
 where
@@ -856,10 +947,28 @@ where
         });
     }
 
-    let file = File::create(output)?;
-    let mut writer = BufWriter::new(file);
-    write_twobit_file(&mut writer, &records)?;
-    writer.flush()?;
+    match out_fmt {
+        OutputFormat::TwoBit => {
+            let file = File::create(output)?;
+            let mut writer = BufWriter::new(file);
+            write_twobit_file(&mut writer, &records)?;
+            writer.flush()?;
+        }
+        OutputFormat::Fasta => {
+            let mut writer = SequenceWriter::create(output, compression)?;
+            let mut buffer = Vec::new();
+            for record in &records {
+                twobit_record_to_fasta(record, FASTA_LINE_WIDTH, &mut buffer);
+            }
+            writer.write_all(&buffer)?;
+            writer.finish()?;
+        }
+        OutputFormat::Fastq => {
+            // Unreachable: resolve_output_format rejects FASTQ for 2bit input.
+            anyhow::bail!("ERROR: cannot produce FASTQ from 2bit input (no quality scores)");
+        }
+    }
+
     Ok(())
 }
 
@@ -1083,28 +1192,289 @@ fn find_fastq_record_starts(data: &[u8]) -> Result<Vec<usize>> {
     Ok(starts)
 }
 
-/// Writes FASTA data to a file.
-fn write_fasta_output(
+/// Writes one output chunk from a FASTA/FASTQ source slice, converting to the
+/// requested output format and applying compression.
+///
+/// The identity paths (FASTA→FASTA, FASTQ→FASTQ) copy/transform the slice
+/// directly; conversions build the target representation in memory first.
+fn write_chunk(
     output: &Path,
-    data: &[u8],
-    gzip_output: bool,
-    uppercase: bool,
+    chunk: &[u8],
+    src: SourceKind,
+    out_fmt: OutputFormat,
+    compression: Option<Compression>,
+    no_mask: bool,
 ) -> Result<()> {
-    let mut writer = SequenceWriter::create(output, gzip_output)?;
-    write_fasta_slice(&mut writer, data, uppercase)?;
-    writer.finish()
+    match out_fmt {
+        OutputFormat::TwoBit => {
+            let records = match src {
+                SourceKind::Fasta => fasta_slice_to_twobit_records(chunk, no_mask)?,
+                SourceKind::Fastq => fastq_slice_to_twobit_records(chunk, no_mask)?,
+            };
+            let file = File::create(output)?;
+            let mut writer = BufWriter::new(file);
+            write_twobit_file(&mut writer, &records)?;
+            writer.flush()?;
+            Ok(())
+        }
+        OutputFormat::Fasta => {
+            let mut writer = SequenceWriter::create(output, compression)?;
+            match src {
+                SourceKind::Fasta => write_fasta_slice(&mut writer, chunk, no_mask)?,
+                SourceKind::Fastq => {
+                    let mut buffer = Vec::with_capacity(chunk.len());
+                    fastq_slice_to_fasta(chunk, no_mask, &mut buffer);
+                    writer.write_all(&buffer)?;
+                }
+            }
+            writer.finish()
+        }
+        OutputFormat::Fastq => {
+            // Only valid for FASTQ sources (validated in resolve_output_format).
+            let mut writer = SequenceWriter::create(output, compression)?;
+            write_fastq_slice(&mut writer, chunk, no_mask)?;
+            writer.finish()
+        }
+    }
 }
 
-/// Writes FASTQ data to a file.
-fn write_fastq_output(
-    output: &Path,
-    data: &[u8],
-    gzip_output: bool,
-    uppercase: bool,
-) -> Result<()> {
-    let mut writer = SequenceWriter::create(output, gzip_output)?;
-    write_fastq_slice(&mut writer, data, uppercase)?;
-    writer.finish()
+/// Returns true when the original input file can be passed through unchanged:
+/// the requested compression must match the source file's on-disk compression.
+fn passthrough_compression_matches(
+    source_path: Option<&Path>,
+    compression: Option<Compression>,
+) -> bool {
+    let Some(path) = source_path else {
+        return false;
+    };
+    let source_is_gzip = path_ends_with(path, ".gz");
+    match compression {
+        None => !source_is_gzip,
+        Some(Compression::Gzip) => source_is_gzip,
+        _ => false,
+    }
+}
+
+/// Converts a FASTQ source slice to FASTA, dropping quality scores.
+fn fastq_slice_to_fasta(data: &[u8], uppercase: bool, out: &mut Vec<u8>) {
+    let mut pos = 0usize;
+    let mut line_index = 0usize;
+
+    while pos < data.len() {
+        let end = line_end(data, pos);
+        let next = next_line_start(data, end);
+        let line = strip_cr(&data[pos..end]);
+
+        match line_index % 4 {
+            0 => {
+                out.push(FASTA_HEADER);
+                let rest = if line.first() == Some(&b'@') {
+                    &line[1..]
+                } else {
+                    line
+                };
+                out.extend_from_slice(rest);
+                out.push(b'\n');
+            }
+            1 => {
+                if uppercase {
+                    out.extend(line.iter().map(|byte| byte.to_ascii_uppercase()));
+                } else {
+                    out.extend_from_slice(line);
+                }
+                out.push(b'\n');
+            }
+            _ => {}
+        }
+
+        line_index += 1;
+        pos = next;
+    }
+}
+
+/// Converts a FASTA source slice into 2bit sequence records.
+fn fasta_slice_to_twobit_records(data: &[u8], no_mask: bool) -> Result<Vec<TwoBitSequence>> {
+    let headers = find_fasta_headers(data);
+    if headers.is_empty() {
+        anyhow::bail!("ERROR: No FASTA records found");
+    }
+
+    let mut records = Vec::with_capacity(headers.len());
+    let mut seen = HashSet::with_capacity(headers.len());
+
+    for (index, &start) in headers.iter().enumerate() {
+        let end = *headers.get(index + 1).unwrap_or(&data.len());
+        let name = extract_fasta_id(data, start);
+        ensure_unique_twobit_name(&mut seen, &name)?;
+        let sequence = concat_fasta_sequence(&data[start..end]);
+        records.push(build_twobit_sequence(name, &sequence, no_mask)?);
+    }
+
+    Ok(records)
+}
+
+/// Converts a FASTQ source slice into 2bit sequence records.
+fn fastq_slice_to_twobit_records(data: &[u8], no_mask: bool) -> Result<Vec<TwoBitSequence>> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pos = 0usize;
+    let mut line_index = 0usize;
+    let mut current_name: Option<String> = None;
+
+    while pos < data.len() {
+        let end = line_end(data, pos);
+        let next = next_line_start(data, end);
+        let line = strip_cr(&data[pos..end]);
+
+        match line_index % 4 {
+            0 => {
+                let header = if line.first() == Some(&b'@') {
+                    &line[1..]
+                } else {
+                    line
+                };
+                let token_end = header
+                    .iter()
+                    .position(|byte| byte.is_ascii_whitespace())
+                    .unwrap_or(header.len());
+                current_name = Some(String::from_utf8_lossy(&header[..token_end]).to_string());
+            }
+            1 => {
+                let name = current_name.take().unwrap_or_else(|| "record".to_string());
+                ensure_unique_twobit_name(&mut seen, &name)?;
+                records.push(build_twobit_sequence(name, line, no_mask)?);
+            }
+            _ => {}
+        }
+
+        line_index += 1;
+        pos = next;
+    }
+
+    if records.is_empty() {
+        anyhow::bail!("ERROR: No FASTQ records found");
+    }
+
+    Ok(records)
+}
+
+/// Writes a single 2bit sequence as a FASTA record, wrapping at `line_width`.
+///
+/// The record's `bases` already reflect masking decisions (hard-mask `N` and,
+/// when softmask is preserved, lowercase soft-mask), so no extra masking is done.
+fn twobit_record_to_fasta(record: &TwoBitSequence, line_width: usize, out: &mut Vec<u8>) {
+    out.push(FASTA_HEADER);
+    out.extend_from_slice(record.name.as_bytes());
+    out.push(b'\n');
+
+    for line in record.bases.chunks(line_width.max(1)) {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+}
+
+/// Builds a 2bit sequence record from a raw (concatenated) sequence.
+///
+/// Detects hard-mask (`N`/`n`) and soft-mask (lowercase) runs. Fails fast on
+/// any base not representable in 2bit (anything other than A/C/G/T/U/N).
+fn build_twobit_sequence(name: String, sequence: &[u8], no_mask: bool) -> Result<TwoBitSequence> {
+    let bases: Vec<u8> = if no_mask {
+        sequence.iter().map(|byte| byte.to_ascii_uppercase()).collect()
+    } else {
+        sequence.to_vec()
+    };
+
+    for (position, &base) in bases.iter().enumerate() {
+        if !is_twobit_base(base) {
+            anyhow::bail!(
+                "ERROR: cannot convert {} to 2bit: code '{}' at position {} is not representable in 2bit (only A/C/G/T/N)",
+                name,
+                base as char,
+                position
+            );
+        }
+    }
+
+    let hard_blocks = find_runs(&bases, |byte| byte == b'N' || byte == b'n');
+    let soft_blocks = if no_mask {
+        Vec::new()
+    } else {
+        find_runs(&bases, |byte| byte.is_ascii_lowercase())
+    };
+
+    Ok(TwoBitSequence {
+        name,
+        length: bases.len(),
+        bases,
+        hard_blocks,
+        soft_blocks,
+    })
+}
+
+/// Returns true if a byte is a nucleotide representable in the 2bit format.
+fn is_twobit_base(base: u8) -> bool {
+    matches!(
+        base,
+        b'A' | b'C' | b'G' | b'T' | b'U' | b'N' | b'a' | b'c' | b'g' | b't' | b'u' | b'n'
+    )
+}
+
+/// Finds maximal runs of bytes satisfying `predicate`, as half-open ranges.
+fn find_runs(data: &[u8], predicate: impl Fn(u8) -> bool) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+
+    for (index, &byte) in data.iter().enumerate() {
+        if predicate(byte) {
+            start.get_or_insert(index);
+        } else if let Some(begin) = start.take() {
+            runs.push(begin..index);
+        }
+    }
+
+    if let Some(begin) = start {
+        runs.push(begin..data.len());
+    }
+
+    runs
+}
+
+/// Concatenates the sequence body of a single FASTA record (skipping the
+/// header line and stripping line breaks), handling multi-line sequences.
+fn concat_fasta_sequence(record: &[u8]) -> Vec<u8> {
+    let Some(newline) = memchr(b'\n', record) else {
+        return Vec::new();
+    };
+
+    let body = &record[newline + 1..];
+    let mut sequence = Vec::with_capacity(body.len());
+    for &byte in body {
+        if byte != b'\n' && byte != b'\r' {
+            sequence.push(byte);
+        }
+    }
+    sequence
+}
+
+/// Errors if a sequence name has already been used within a single 2bit output.
+fn ensure_unique_twobit_name(seen: &mut HashSet<String>, name: &str) -> Result<()> {
+    if !seen.insert(name.to_string()) {
+        anyhow::bail!(
+            "ERROR: duplicate sequence name '{}' in a single 2bit output; \
+             use --headers or a smaller --chunks to keep names unique per file",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Strips a single trailing carriage return from a line slice.
+fn strip_cr(line: &[u8]) -> &[u8] {
+    if line.last() == Some(&b'\r') {
+        &line[..line.len() - 1]
+    } else {
+        line
+    }
 }
 
 /// Writes FASTA data with optional uppercase conversion.

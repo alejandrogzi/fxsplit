@@ -162,6 +162,28 @@ pub fn join(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// Reads all content from a bzip2-compressed file.
+pub fn read_bzip2(path: &Path) -> String {
+    let file = File::open(path).expect("failed to open bz2 file");
+    let mut decoder = bzip2::read::BzDecoder::new(file);
+    let mut out = String::new();
+    decoder
+        .read_to_string(&mut out)
+        .expect("failed to read bz2 contents");
+    out
+}
+
+/// Reads all content from a zstd-compressed file.
+pub fn read_zstd(path: &Path) -> String {
+    let file = File::open(path).expect("failed to open zst file");
+    let mut decoder = zstd::Decoder::new(file).expect("failed to build zstd decoder");
+    let mut out = String::new();
+    decoder
+        .read_to_string(&mut out)
+        .expect("failed to read zst contents");
+    out
+}
+
 /// Reads all content from a file (optionally gzipped).
 fn read_all(path: &Path, gz: bool) -> String {
     if gz {

@@ -22,6 +22,8 @@ fn fasta_gz_chunks_mean_records_per_file() {
         "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
+        "--compression".to_string(),
+        "gzip".to_string(),
     ]);
 
     let files = list_files(&outdir);
@@ -54,6 +56,8 @@ fn fasta_gz_files_mean_number_of_output_files() {
         "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
+        "--compression".to_string(),
+        "gzip".to_string(),
     ]);
 
     let files = list_files(&outdir);
@@ -82,6 +86,8 @@ fn fasta_gz_headers_use_sanitized_ids() {
         "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
+        "--compression".to_string(),
+        "gzip".to_string(),
     ]);
 
     let files = list_files(&outdir);
