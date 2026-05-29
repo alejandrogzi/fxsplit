@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Alejandro Gonzalez-Irribarren <alejandrxgzi@gmail.com>
 // Distributed under the terms of the Apache License, Version 2.0.
 
-use crate::SplitMode;
+use crate::{Compression, OutputFormat, SplitMode};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -97,6 +97,26 @@ pub struct Args {
         action = clap::ArgAction::SetTrue
     )]
     pub no_mask: bool,
+
+    #[arg(
+        short = 'Z',
+        long = "output-format",
+        required = false,
+        value_name = "FORMAT",
+        value_enum,
+        help = "Output format: fasta, fastq, or 2bit (default: same as input). fastq output requires fastq input"
+    )]
+    pub output_format: Option<OutputFormat>,
+
+    #[arg(
+        short = 'G',
+        long = "compression",
+        required = false,
+        value_name = "CODEC",
+        value_enum,
+        help = "Compress all fasta/fastq outputs with the given codec: gzip, bzip2, or zstd (default: uncompressed). 2bit outputs are never compressed"
+    )]
+    pub compression: Option<Compression>,
 }
 
 impl Args {

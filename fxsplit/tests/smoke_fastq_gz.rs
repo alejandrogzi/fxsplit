@@ -23,6 +23,8 @@ fn fastq_gz_chunks_mean_records_per_file() {
         "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
+        "--compression".to_string(),
+        "gzip".to_string(),
     ]);
 
     let files = list_files(&outdir);
@@ -52,6 +54,8 @@ fn fastq_gz_files_mean_number_of_output_files() {
         "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
+        "--compression".to_string(),
+        "gzip".to_string(),
     ]);
 
     let files = list_files(&outdir);
@@ -80,6 +84,8 @@ fn fastq_gz_rejects_headers_mode() {
         "2".to_string(),
         "--outdir".to_string(),
         path_str(&outdir),
+        "--compression".to_string(),
+        "gzip".to_string(),
     ]);
 
     assert!(err.contains("only supported for FASTA/FASTA.GZ/2BIT"));

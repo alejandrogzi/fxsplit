@@ -71,6 +71,8 @@ fn gz_fastq_can_be_read_from_stdin() {
             "2",
             "--outdir",
             &path_str(&outdir),
+            "--compression",
+            "gzip",
         ],
         &input,
     );
