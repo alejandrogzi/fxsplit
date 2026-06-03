@@ -145,6 +145,8 @@ pub enum SplitMode {
     NumFiles(usize),
     /// Create one output file per FASTA/2bit header
     FileHeader,
+    /// Split each record into fixed-length base-pair windows, one file per window
+    BasePairs(usize),
 }
 
 /// Represents a range of record indices for chunking.
@@ -666,6 +668,20 @@ where
     create_dir_all(&args.outdir)?;
     let suffix = args.suffix.clone().unwrap_or_default();
 
+    if let SplitMode::BasePairs(window) = mode {
+        return split_fasta_basepairs(
+            args,
+            &data,
+            &headers,
+            window,
+            out_fmt,
+            compression,
+            &extension,
+            &suffix,
+            &pool,
+        );
+    }
+
     if out_fmt == OutputFormat::Fasta
         && !args.no_mask
         && passthrough_compression_matches(source_path, compression)
@@ -729,6 +745,102 @@ where
     Ok(())
 }
 
+/// Splits FASTA data into fixed-length base-pair windows, one output file per
+/// window named `{header}:{start}-{end}` (1-based inclusive).
+///
+/// Parallelizes across records (like `--headers`): each record's body is
+/// concatenated exactly once, then its windows are sliced and written in turn.
+/// Filenames are pre-computed and de-duplicated up front so the parallel writes
+/// stay coordination-free.
+#[allow(clippy::too_many_arguments)]
+fn split_fasta_basepairs<B>(
+    args: &Args,
+    data: &SharedBytes<B>,
+    headers: &[usize],
+    window: usize,
+    out_fmt: OutputFormat,
+    compression: Option<Compression>,
+    extension: &str,
+    suffix: &str,
+    pool: &rayon::ThreadPool,
+) -> Result<()>
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    if window == 0 {
+        anyhow::bail!("ERROR: --basepairs must be greater than 0");
+    }
+
+    let bytes = data.as_slice();
+    let total = bytes.len();
+
+    let ids = headers
+        .iter()
+        .map(|&start| extract_fasta_id(bytes, start))
+        .collect::<Vec<_>>();
+    let lengths = headers
+        .iter()
+        .enumerate()
+        .map(|(index, &start)| {
+            let end = *headers.get(index + 1).unwrap_or(&total);
+            fasta_record_seq_len(&bytes[start..end])
+        })
+        .collect::<Vec<_>>();
+
+    let per_record_windows = ids
+        .iter()
+        .zip(&lengths)
+        .map(|(id, &length)| basepair_windows(id, length, window))
+        .collect::<Vec<_>>();
+
+    let window_names = per_record_windows
+        .iter()
+        .flat_map(|windows| windows.iter().map(|(_, _, name)| name.clone()))
+        .collect::<Vec<_>>();
+    let total_windows = window_names.len();
+    let filenames = make_unique_filenames_from_ids(&window_names, suffix, extension);
+
+    warn_if_many_header_outputs(total_windows, &input_label(args));
+
+    // Prefix sum of window counts -> base filename index per record.
+    let mut base_index = Vec::with_capacity(per_record_windows.len());
+    let mut running = 0usize;
+    for windows in &per_record_windows {
+        base_index.push(running);
+        running += windows.len();
+    }
+
+    pool.install(|| {
+        headers
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(index, &start)| -> Result<()> {
+                let end = *headers.get(index + 1).unwrap_or(&total);
+                let sequence = concat_fasta_sequence(&bytes[start..end]);
+                let file_base = base_index[index];
+
+                for (offset, (win_start, win_end, name)) in
+                    per_record_windows[index].iter().enumerate()
+                {
+                    let output = PathBuf::from(&args.outdir).join(&filenames[file_base + offset]);
+                    write_sequence_window(
+                        &output,
+                        name,
+                        &sequence[*win_start..*win_end],
+                        out_fmt,
+                        compression,
+                        args.no_mask,
+                        FASTA_LINE_WIDTH,
+                    )?;
+                }
+
+                Ok(())
+            })
+    })?;
+
+    Ok(())
+}
+
 /// Splits FASTQ data into chunks using parallel processing.
 ///
 /// # Arguments
@@ -742,6 +854,11 @@ where
     if matches!(mode, SplitMode::FileHeader) {
         anyhow::bail!(
             "ERROR: --headers is only supported for FASTA/FASTA.GZ/2BIT files, not FASTQ/FASTQ.GZ"
+        );
+    }
+    if matches!(mode, SplitMode::BasePairs(_)) {
+        anyhow::bail!(
+            "ERROR: --basepairs is only supported for FASTA/FASTA.GZ/2BIT files, not FASTQ/FASTQ.GZ"
         );
     }
 
@@ -828,6 +945,21 @@ where
 
     create_dir_all(&args.outdir)?;
 
+    if let SplitMode::BasePairs(window) = mode {
+        return split_2bit_basepairs(
+            args,
+            data.clone(),
+            &names,
+            &lengths,
+            window,
+            out_fmt,
+            compression,
+            &extension,
+            &suffix,
+            &pool,
+        );
+    }
+
     if matches!(mode, SplitMode::FileHeader) {
         warn_if_many_header_outputs(names.len(), &input_label(args));
         let filenames = make_unique_filenames_from_ids(&names, &suffix, &extension);
@@ -878,6 +1010,85 @@ where
                     !args.no_mask,
                 )
             })
+    })?;
+
+    Ok(())
+}
+
+/// Splits 2bit data into fixed-length base-pair windows, one output file per
+/// window named `{name}:{start}-{end}` (1-based inclusive).
+///
+/// Windows are flattened across all sequences and written in parallel. Each
+/// rayon worker opens its own `TwoBitFile` reader once (via `try_for_each_init`)
+/// and reuses it for every window it handles, reading only each window's
+/// sub-range from the mmap'd input.
+#[allow(clippy::too_many_arguments)]
+fn split_2bit_basepairs<B>(
+    args: &Args,
+    data: SharedBytes<B>,
+    names: &[String],
+    lengths: &[usize],
+    window: usize,
+    out_fmt: OutputFormat,
+    compression: Option<Compression>,
+    extension: &str,
+    suffix: &str,
+    pool: &rayon::ThreadPool,
+) -> Result<()>
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    if window == 0 {
+        anyhow::bail!("ERROR: --basepairs must be greater than 0");
+    }
+
+    let windows = names
+        .iter()
+        .zip(lengths)
+        .enumerate()
+        .flat_map(|(seq_index, (name, &length))| {
+            basepair_windows(name, length, window)
+                .into_iter()
+                .map(move |(start, end, win_name)| (seq_index, start, end, win_name))
+        })
+        .collect::<Vec<_>>();
+
+    let window_names = windows
+        .iter()
+        .map(|(_, _, _, name)| name.clone())
+        .collect::<Vec<_>>();
+    let total_windows = window_names.len();
+    let filenames = make_unique_filenames_from_ids(&window_names, suffix, extension);
+
+    warn_if_many_header_outputs(total_windows, &input_label(args));
+
+    let preserve_softmask = !args.no_mask;
+
+    pool.install(|| {
+        windows.par_iter().enumerate().try_for_each_init(
+            || {
+                TwoBitFile::from_buf(data.clone())
+                    .map(|reader| reader.enable_softmask(preserve_softmask))
+            },
+            |reader, (index, win)| -> Result<()> {
+                let reader = reader.as_mut().map_err(|err| anyhow!(err.to_string()))?;
+                let (seq_index, win_start, win_end, name) = win;
+                let bases = reader
+                    .read_sequence(&names[*seq_index], *win_start..*win_end)
+                    .map_err(|err| anyhow!(err.to_string()))?
+                    .into_bytes();
+                let output = PathBuf::from(&args.outdir).join(&filenames[index]);
+                write_sequence_window(
+                    &output,
+                    name,
+                    &bases,
+                    out_fmt,
+                    compression,
+                    args.no_mask,
+                    FASTA_LINE_WIDTH,
+                )
+            },
+        )
     })?;
 
     Ok(())
@@ -1132,7 +1343,51 @@ fn record_ranges_for_mode(num_records: usize, mode: SplitMode) -> Result<Vec<Chu
                 end: index + 1,
             })
             .collect()),
+        SplitMode::BasePairs(_) => {
+            // BasePairs is served by dedicated split paths and never reaches here.
+            anyhow::bail!("ERROR: --basepairs does not use record-index ranges")
+        }
     }
+}
+
+/// Enumerates the base-pair windows for a sequence of `length` bases.
+///
+/// Returns `(start, end, name)` per window, where `[start, end)` is the
+/// 0-based half-open base range and `name` is the windowed record name using
+/// 1-based inclusive coordinates: `{base}:{start + 1}-{end}`.
+///
+/// When `window >= length` the record is emitted whole under its bare `base`
+/// name (no coordinate suffix), matching `--headers` behavior.
+fn basepair_windows(base: &str, length: usize, window: usize) -> Vec<(usize, usize, String)> {
+    if window >= length {
+        return vec![(0, length, base.to_string())];
+    }
+
+    let count = length.div_ceil(window);
+    (0..count)
+        .map(|index| {
+            let start = index * window;
+            let end = ((index + 1) * window).min(length);
+            (start, end, format!("{base}:{}-{}", start + 1, end))
+        })
+        .collect()
+}
+
+/// Returns the concatenated sequence length of a single FASTA record (the
+/// number of body bytes excluding line breaks), without allocating.
+///
+/// Matches exactly the length that [`concat_fasta_sequence`] would produce, so
+/// windows enumerated from this length always index in-bounds into the
+/// concatenated body.
+fn fasta_record_seq_len(record: &[u8]) -> usize {
+    let Some(newline) = memchr(b'\n', record) else {
+        return 0;
+    };
+
+    let body = &record[newline + 1..];
+    let newlines = memchr_iter(b'\n', body).count();
+    let carriage = memchr_iter(b'\r', body).count();
+    body.len() - newlines - carriage
 }
 
 /// Finds FASTQ record start positions (lines starting with '@').
@@ -1229,6 +1484,63 @@ fn write_chunk(
             let mut writer = SequenceWriter::create(output, compression)?;
             write_fastq_slice(&mut writer, chunk, no_mask)?;
             writer.finish()
+        }
+    }
+}
+
+/// Writes a single windowed sequence record to its own output file.
+///
+/// `bases` is the contiguous (already concatenated) window sequence. It is
+/// emitted under `name` in the requested output format with optional
+/// compression, re-wrapping FASTA output at `line_width`. Shared by the FASTA
+/// and 2bit base-pair split paths.
+fn write_sequence_window(
+    output: &Path,
+    name: &str,
+    bases: &[u8],
+    out_fmt: OutputFormat,
+    compression: Option<Compression>,
+    no_mask: bool,
+    line_width: usize,
+) -> Result<()> {
+    match out_fmt {
+        OutputFormat::Fasta => {
+            let mut writer = SequenceWriter::create(output, compression)?;
+            writer.write_all(&[FASTA_HEADER])?;
+            writer.write_all(name.as_bytes())?;
+            writer.write_all(b"\n")?;
+
+            let width = line_width.max(1);
+            if no_mask {
+                let mut line_buffer = Vec::with_capacity(width);
+                for line in bases.chunks(width) {
+                    line_buffer.clear();
+                    line_buffer.extend(line.iter().map(|byte| byte.to_ascii_uppercase()));
+                    writer.write_all(&line_buffer)?;
+                    writer.write_all(b"\n")?;
+                }
+            } else {
+                for line in bases.chunks(width) {
+                    writer.write_all(line)?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+
+            writer.finish()
+        }
+        OutputFormat::TwoBit => {
+            let record = build_twobit_sequence(name.to_string(), bases, no_mask)?;
+            let file = File::create(output)?;
+            let mut writer = BufWriter::new(file);
+            write_twobit_file(&mut writer, &[record])?;
+            writer.flush()?;
+            Ok(())
+        }
+        OutputFormat::Fastq => {
+            // Unreachable: --basepairs only accepts FASTA/2bit input.
+            anyhow::bail!(
+                "ERROR: cannot produce FASTQ output with --basepairs (FASTA/2bit input only)"
+            );
         }
     }
 }
