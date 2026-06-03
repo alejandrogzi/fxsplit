@@ -1,7 +1,7 @@
 [package]
 name = "fxsplit"
 description = "split FASTX into N chunks/files/headers"
-version = "0.0.4"
+version = "0.0.5"
 keywords = ["split", "fasta", "fastq", "io"]
 readme = "../README.md"
 homepage = "https://github.com/alejandrogzi/isotools"
@@ -23,7 +23,7 @@ memmap2 = "0.9.4"
 flate2 = "1.0.20"
 bzip2 = "0.6.1"
 zstd = "0.13.0"
-twobit = "0.2.1"
+twobit = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3.12.0"

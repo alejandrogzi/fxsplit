@@ -53,6 +53,17 @@ pub struct Args {
     pub headers: bool,
 
     #[arg(
+        short = 'b',
+        long = "basepairs",
+        required = false,
+        value_name = "BASEPAIRS",
+        conflicts_with_all(["chunks", "files", "headers"]),
+        help = "Split each FASTA/2BIT record into fixed-length base-pair windows; \
+                one output file per window named {header}:{start}-{end} (1-based)"
+    )]
+    pub basepairs: Option<usize>,
+
+    #[arg(
         short = 't',
         long = "threads",
         help = "Number of Rayon worker threads",
@@ -135,12 +146,13 @@ impl Args {
     /// # Errors
     /// Returns error if multiple or no split modes are specified
     pub fn mode(&self) -> anyhow::Result<SplitMode> {
-        match (self.chunks, self.files, self.headers) {
-            (Some(n), None, false) => Ok(SplitMode::ChunkSize(n)),
-            (None, Some(n), false) => Ok(SplitMode::NumFiles(n)),
-            (None, None, true) => Ok(SplitMode::FileHeader),
+        match (self.chunks, self.files, self.headers, self.basepairs) {
+            (Some(n), None, false, None) => Ok(SplitMode::ChunkSize(n)),
+            (None, Some(n), false, None) => Ok(SplitMode::NumFiles(n)),
+            (None, None, true, None) => Ok(SplitMode::FileHeader),
+            (None, None, false, Some(n)) => Ok(SplitMode::BasePairs(n)),
             _ => Err(anyhow::anyhow!(
-                "You must provide exactly one split mode: --chunks, --files, or --headers"
+                "You must provide exactly one split mode: --chunks, --files, --headers, or --basepairs"
             )),
         }
     }
